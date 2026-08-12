@@ -1,50 +1,89 @@
-#!/bin/bash
-# gitgo（Git 通）— 自动检测代理端口并配置 Git
-# 用法: gitgo [端口号]
+#!/usr/bin/env bash
+# gitgo（Git 通）：发现本机代理端口、配置 Git，并验证 GitHub。
+set -u
 
-PORTS=(7890 7891 7892 7893 1080 10808 10809 8080 8118)
-FOUND=""
+COMMON_PORTS=(7890 7891 7892 7893 7897 1080 10808 10809 8080 8118)
+PROXY_NAMES='clash|verge|mihomo|v2ray|xray|sing-box|nekoray|shadowsocks'
+CANDIDATES=()
 
-if [ -n "$1" ]; then
-    FOUND="$1"
-    if ! netstat -ano 2>/dev/null | grep -q "127.0.0.1:${FOUND} .*LISTENING"; then
-        echo "警告: 端口 ${FOUND} 未检测到监听，继续配置..."
-    fi
+add_candidate() {
+    local port="${1:-}"
+    [[ "$port" =~ ^[0-9]+$ ]] || return 0
+    ((port >= 1 && port <= 65535)) || return 0
+    [[ " ${CANDIDATES[*]} " == *" $port "* ]] || CANDIDATES+=("$port")
+}
+
+is_listening() {
+    local port="$1"
+    netstat -ano 2>/dev/null | grep -Eqi "(127\\.0\\.0\\.1|0\\.0\\.0\\.0|\\[::\\]):${port}[[:space:]].*(LISTENING|LISTEN)"
+}
+
+proxy_works() {
+    local port="$1"
+    curl -fsSI --proxy "http://127.0.0.1:${port}" --connect-timeout 3 --max-time 8 https://github.com/ >/dev/null 2>&1
+}
+
+if [[ -n "${1:-}" ]]; then
+    add_candidate "$1"
 else
-    for port in "${PORTS[@]}"; do
-        if netstat -ano 2>/dev/null | grep -q "127.0.0.1:${port} .*LISTENING"; then
-            FOUND="$port"
-            break
-        fi
-    done
-    if [ -z "$FOUND" ]; then
-        echo "未检测到运行中的代理（已检查: ${PORTS[*]}）"
-        echo "请先启动梯子软件，或指定端口: gitgo <端口号>"
-        exit 1
+    # 先检查已有 Git 配置中的端口。
+    while IFS= read -r port; do add_candidate "$port"; done < <(
+        git config --global --get-regexp '^(http|https)\.proxy$' 2>/dev/null |
+            sed -nE 's#.*127\.0\.0\.1:([0-9]+).*#\1#p'
+    )
+
+    for port in "${COMMON_PORTS[@]}"; do add_candidate "$port"; done
+
+    # Windows：根据监听端口的所属进程动态发现 Clash/Mihomo 等代理。
+    if command -v powershell.exe >/dev/null 2>&1; then
+        while IFS= read -r port; do add_candidate "$port"; done < <(
+            powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \
+                "Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | ForEach-Object { \$proc = Get-Process -Id \$_.OwningProcess -ErrorAction SilentlyContinue; if (\$proc.ProcessName -match '$PROXY_NAMES') { \$_.LocalPort } } | Sort-Object -Unique" 2>/dev/null | tr -d '\r'
+        )
     fi
 fi
 
-echo "检测到代理: 127.0.0.1:$FOUND"
-git config --global http.proxy "http://127.0.0.1:$FOUND"
-git config --global https.proxy "http://127.0.0.1:$FOUND"
+FOUND=""
+for port in "${CANDIDATES[@]}"; do
+    is_listening "$port" || continue
+    echo "发现监听端口: 127.0.0.1:${port}，正在验证代理..."
+    if proxy_works "$port"; then
+        FOUND="$port"
+        break
+    fi
+done
 
-git config --global url."https://github.com/".insteadOf "git@github.com:" 2>/dev/null
-git config --global url."https://github.com/".insteadOf "ssh://git@github.com/" 2>/dev/null
+if [[ -z "$FOUND" ]]; then
+    echo "未发现能够访问 GitHub 的本机 HTTP 代理。"
+    echo "请确认代理软件已启动，或指定端口: gitgo <端口号>"
+    exit 1
+fi
 
-export HTTP_PROXY="http://127.0.0.1:$FOUND"
-export HTTPS_PROXY="http://127.0.0.1:$FOUND"
-export http_proxy="http://127.0.0.1:$FOUND"
-export https_proxy="http://127.0.0.1:$FOUND"
+git config --global http.proxy "http://127.0.0.1:${FOUND}"
+git config --global https.proxy "http://127.0.0.1:${FOUND}"
 
-# npm 代理（Claude Code 自动更新需要）
-npm config set proxy "http://127.0.0.1:$FOUND" 2>/dev/null
-npm config set https-proxy "http://127.0.0.1:$FOUND" 2>/dev/null
+for rewrite in 'git@github.com:' 'ssh://git@github.com/'; do
+    if ! git config --global --get-all url."https://github.com/".insteadOf 2>/dev/null | grep -Fxq "$rewrite"; then
+        git config --global --add url."https://github.com/".insteadOf "$rewrite"
+    fi
+done
 
-echo "Git + npm 代理已更新 → 127.0.0.1:$FOUND"
+export HTTP_PROXY="http://127.0.0.1:${FOUND}"
+export HTTPS_PROXY="$HTTP_PROXY"
+export http_proxy="$HTTP_PROXY"
+export https_proxy="$HTTP_PROXY"
 
-if git ls-remote https://github.com/octocat/Hello-World.git HEAD &>/dev/null; then
-    echo "✓ GitHub 连接正常"
+if command -v npm >/dev/null 2>&1; then
+    npm config set proxy "$HTTP_PROXY" >/dev/null 2>&1 || true
+    npm config set https-proxy "$HTTP_PROXY" >/dev/null 2>&1 || true
+    echo "Git + npm 代理已更新为 127.0.0.1:${FOUND}"
 else
-    echo "✗ GitHub 连接失败，请检查代理或更换节点"
+    echo "Git 代理已更新为 127.0.0.1:${FOUND}"
+fi
+
+if git ls-remote https://github.com/octocat/Hello-World.git HEAD >/dev/null 2>&1; then
+    echo "GitHub 连接正常"
+else
+    echo "GitHub 连接失败，请检查代理软件或更换节点"
     exit 2
 fi
